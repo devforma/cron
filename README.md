@@ -94,17 +94,8 @@ cron.New(cron.WithParser(cron.NewParser(
   UPDATING: To opt into panic recovery and configure the panic logger:
 ```go
 cron.New(cron.WithChain(
-  cron.Recover(logger),  // or use cron.DefaultLogger
+  cron.Recover(logger)
 ))
-```
-- In adding support for https://github.com/go-logr/logr, `cron.WithVerboseLogger` was
-  removed, since it is duplicative with the leveled logging.
-
-  UPDATING: Callers should use `WithLogger` and specify a logger that does not
-  discard `Info` logs. For convenience, one is provided that wraps `*log.Logger`:
-```go
-cron.New(
-  cron.WithLogger(cron.VerbosePrintfLogger(logger)))
 ```
 
 ### Background - Cron spec format

@@ -16,9 +16,9 @@ type Cron struct {
 	stop      chan struct{}
 	add       chan *Entry
 	remove    chan EntryID
+	removeTag chan string
 	snapshot  chan chan []Entry
 	running   bool
-	logger    Logger
 	runningMu sync.Mutex
 	location  *time.Location
 	parser    ScheduleParser
@@ -51,6 +51,10 @@ type Entry struct {
 	// ID is the cron-assigned ID of this entry, which may be used to look up a
 	// snapshot or remove it.
 	ID EntryID
+
+	// Tag is the tag of this entry, which may be used to look up a
+	// snapshot or remove it.
+	Tag string
 
 	// Schedule on which this job should be run.
 	Schedule Schedule
@@ -97,17 +101,17 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -120,7 +124,6 @@ func New(opts ...Option) *Cron {
 		remove:    make(chan EntryID),
 		running:   false,
 		runningMu: sync.Mutex{},
-		logger:    DefaultLogger,
 		location:  time.Local,
 		parser:    standardParser,
 	}
@@ -138,29 +141,30 @@ func (f FuncJob) Run() { f() }
 // AddFunc adds a func to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
-	return c.AddJob(spec, FuncJob(cmd))
+func (c *Cron) AddFunc(tag string, spec string, cmd func()) (EntryID, error) {
+	return c.AddJob(tag, spec, FuncJob(cmd))
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
-func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
+func (c *Cron) AddJob(tag string, spec string, cmd Job) (EntryID, error) {
 	schedule, err := c.parser.Parse(spec)
 	if err != nil {
 		return 0, err
 	}
-	return c.Schedule(schedule, cmd), nil
+	return c.Schedule(schedule, cmd, tag), nil
 }
 
 // Schedule adds a Job to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
+func (c *Cron) Schedule(schedule Schedule, cmd Job, tag string) EntryID {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	c.nextID++
 	entry := &Entry{
 		ID:         c.nextID,
+		Tag:        tag,
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
@@ -211,6 +215,17 @@ func (c *Cron) Remove(id EntryID) {
 	}
 }
 
+// RemoveByTag remove an entry from being run in the future by tag.
+func (c *Cron) RemoveByTag(tag string) {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if c.running {
+		c.removeTag <- tag
+	} else {
+		c.removeEntryByTag(tag)
+	}
+}
+
 // Start the cron scheduler in its own goroutine, or no-op if already started.
 func (c *Cron) Start() {
 	c.runningMu.Lock()
@@ -237,13 +252,10 @@ func (c *Cron) Run() {
 // run the scheduler.. this is private just due to the need to synchronize
 // access to the 'running' state variable.
 func (c *Cron) run() {
-	c.logger.Info("start")
-
 	// Figure out the next activation times for each entry.
 	now := c.now()
 	for _, entry := range c.entries {
 		entry.Next = entry.Schedule.Next(now)
-		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
 
 	for {
@@ -263,7 +275,6 @@ func (c *Cron) run() {
 			select {
 			case now = <-timer.C:
 				now = now.In(c.location)
-				c.logger.Info("wake", "now", now)
 
 				// Run every entry whose next time was less than now
 				for _, e := range c.entries {
@@ -273,7 +284,6 @@ func (c *Cron) run() {
 					c.startJob(e.WrappedJob)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
-					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
 			case newEntry := <-c.add:
@@ -281,7 +291,6 @@ func (c *Cron) run() {
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
 				c.entries = append(c.entries, newEntry)
-				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
 
 			case replyChan := <-c.snapshot:
 				replyChan <- c.entrySnapshot()
@@ -289,14 +298,17 @@ func (c *Cron) run() {
 
 			case <-c.stop:
 				timer.Stop()
-				c.logger.Info("stop")
 				return
 
 			case id := <-c.remove:
 				timer.Stop()
 				now = c.now()
 				c.removeEntry(id)
-				c.logger.Info("removed", "entry", id)
+
+			case tag := <-c.removeTag:
+				timer.Stop()
+				now = c.now()
+				c.removeEntryByTag(tag)
 			}
 
 			break
@@ -348,6 +360,16 @@ func (c *Cron) removeEntry(id EntryID) {
 	var entries []*Entry
 	for _, e := range c.entries {
 		if e.ID != id {
+			entries = append(entries, e)
+		}
+	}
+	c.entries = entries
+}
+
+func (c *Cron) removeEntryByTag(tag string) {
+	var entries []*Entry
+	for _, e := range c.entries {
+		if e.Tag != tag {
 			entries = append(entries, e)
 		}
 	}
