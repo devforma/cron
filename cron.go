@@ -122,6 +122,7 @@ func New(opts ...Option) *Cron {
 		stop:      make(chan struct{}),
 		snapshot:  make(chan chan []Entry),
 		remove:    make(chan EntryID),
+		removeTag: make(chan string),
 		running:   false,
 		runningMu: sync.Mutex{},
 		location:  time.Local,
